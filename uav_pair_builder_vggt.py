@@ -546,29 +546,29 @@ def run_all_sequences(args):
 def build_argparser():
     ap = argparse.ArgumentParser()
     # 输入：图像与阶段一指标
-    ap.add_argument("--image_root",   type=str, default="/mnt/data_nvme3n1p1/dataset/UAV_ula/dataset/Validation",
+    ap.add_argument("--image_root",   type=str, default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/All",
                     help="原始图像根目录（与阶段一一致）")
-    ap.add_argument("--metrics_root", type=str, default="/mnt/data_nvme3n1p1/dataset/UAV_ula/uav_triplets",
+    ap.add_argument("--metrics_root", type=str, default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri",
                     help="阶段一输出根目录（包含 <seq>/frames.jsonl 与 global_stats.json）")
     # 输出
-    ap.add_argument("--out_root",     type=str, default="/mnt/data_nvme3n1p1/dataset/UAV_ula/uav_triplets",
+    ap.add_argument("--out_root",     type=str, default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri",
                     help="输出根目录（每序列一个 triplets.jsonl；另含 frame/geom 拒绝记录）")
     # 滑窗
-    ap.add_argument("--window",       type=int, default=2, help="候选前后帧窗口半径 k（全程三帧将做 k×k 笛卡尔积）")
+    ap.add_argument("--window",       type=int, default=6, help="候选前后帧窗口半径 k（全程三帧将做 k×k 笛卡尔积）")
     # 逐帧质量过滤阈值
     ap.add_argument("--min_lap_p",    type=float, default=0.10, help="拉普拉斯方差低于本序列分位数则过滤（0~1）")
     ap.add_argument("--max_clip",     type=float, default=0.10, help="欠/过曝比例任何一项超过则过滤")
     ap.add_argument("--min_val",      type=float, default=20.0, help="V 均值过低过滤 [0,255]")
     # 几何/指标/阈值
-    ap.add_argument("--eps_px",       type=float, default=0.5, help="可用视差下限（像素）")
-    ap.add_argument("--delta_px",     type=float, default=40.0, help="可用视差上限（像素）")
+    ap.add_argument("--eps_px",       type=float, default=2.0, help="可用视差下限（像素）")
+    ap.add_argument("--delta_px",     type=float, default=80.0, help="可用视差上限（像素）")
     ap.add_argument("--rmax_deg",     type=float, default=30.0, help="旋转上限（度）")
     ap.add_argument("--fmax",         type=float, default=0.85, help="前向占比上限")
     ap.add_argument("--Omin",         type=float, default=0.50, help="重叠率下限（单侧）")
     ap.add_argument("--Umin",         type=float, default=0.10, help="可用视差率下限（单侧）")
     # 打分权重（单侧）
-    ap.add_argument("--gamma_O",      type=float, default=2.0, help="O 幂")
-    ap.add_argument("--gamma_U",      type=float, default=3.0, help="U 幂")
+    ap.add_argument("--gamma_O",      type=float, default=1.5, help="O 幂")
+    ap.add_argument("--gamma_U",      type=float, default=2.0, help="U 幂")
     ap.add_argument("--w_Q",          type=float, default=1.0, help="Q 幂（画质权重）")
     ap.add_argument("--lam_f",        type=float, default=2.0, help="前向占比软惩罚系数")
     ap.add_argument("--lam_r",        type=float, default=1.0, help="旋转软惩罚系数")

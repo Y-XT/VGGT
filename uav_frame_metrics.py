@@ -3,6 +3,9 @@
 """
 uav_frame_metrics.py
 
+针对uavid2020
+若不做过滤，阶段一会对 data/ 与 data_1280/ 分别产出 frames.jsonl；阶段二也会分别构建三元组，数据量翻倍
+
 阶段一（离线逐帧统计）：
   - 递归遍历 root_dir 下的所有“叶子图像目录”（含 >=min_images 的图像目录）
   - 为每帧计算轻量图像级指标（不依赖 VGGT）：
@@ -100,9 +103,9 @@ def resize_short_side(img: np.ndarray, short_side: int) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root_dir", type=str, default="/mnt/data_nvme3n1p1/dataset/UAV_ula/dataset/Validation",
+    ap.add_argument("--root_dir", type=str, default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/All",
                     help="根目录（包含多个子目录/序列）")
-    ap.add_argument("--out_dir",  type=str, default="/mnt/data_nvme3n1p1/dataset/UAV_ula/uav_triplets",
+    ap.add_argument("--out_dir",  type=str, default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri",
                     help="输出根目录（每序列一个 frames.jsonl + 全局 global_stats.json）")
     ap.add_argument("--min_images", type=int, default=10, help="识别为序列目录的最少图像数")
     ap.add_argument("--short_side", type=int, default=0, help="指标计算时的短边（0 表示不缩放）")
