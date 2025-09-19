@@ -429,7 +429,6 @@ def photometric_loss_dense(img_t_bgr: np.ndarray, img_s_bgr: np.ndarray,
 def pair_score(metrics: dict, Q_pair: float,
                gamma_O=1.5, gamma_U=2.0, w_Q=1.0,
                lam_f=2.0, lam_r=1.0,
-               beta_disp=0.12, target_disp_px=8.0,
                lambda_photo=3.0, L_photo: Optional[float] = None) -> float:
     """
     单侧分（不含“目标视差奖励”的乘法项，由调用方另乘）：
@@ -452,201 +451,6 @@ def pair_score(metrics: dict, Q_pair: float,
         base *= float(np.exp(-lambda_photo * L_photo))
 
     return float(base)
-
-
-# ---------------- VGGT 前向 ----------------
-def vggt_forward_triplet(model: VGGT, device: str, dtype: torch.dtype, paths: List[str]):
-    """以顺序 [t,p,n] 载入图像并前向一次：
-       返回三帧的 E/K（numpy）、中心帧深度 D_t、中心帧深度置信度 conf_t（如有）、以及 H/W。
-    """
-    images = load_and_preprocess_images(paths).to(device)
-    amp = torch.cuda.amp.autocast(dtype=dtype) if device == "cuda" else nullcontext()
-    with torch.no_grad():
-        with amp:
-            preds = model(images)
-
-    # 从 pose encoding 解码 E/K（注意 E 为 world->cam）
-    E, K = pose_encoding_to_extri_intri(preds["pose_enc"], images.shape[-2:])
-    E = E[0].detach().cpu().numpy()
-    K = K[0].detach().cpu().numpy()
-
-    # 深度：只取中心帧（索引 0）；处理可能的 (3,1,H,W) 格式
-    D = preds["depth"][0].detach().cpu().numpy()  # (3,H,W) 或 (3,1,H,W)
-    if D.ndim == 4 and D.shape[1] == 1:
-        D = D[:, 0]
-    D_t = _as_hw_depth(D[0])
-    H, W = D_t.shape
-
-    # 置信度（若模型提供 depth_conf）
-    conf_t = None
-    if "depth_conf" in preds:
-        C = preds["depth_conf"][0].detach().cpu().numpy()
-        if C.ndim == 4 and C.shape[1] == 1:
-            C = C[:, 0]
-        conf_t = _normalize_conf_map(_as_hw_depth(C[0]).astype(np.float32))
-
-    return E, K, D_t, conf_t, H, W
-
-
-# ---------------- 主评估：单个三元组（已改：idx/dt 来自文件名数字） ----------------
-def evaluate_triplet(frames: list, image_paths: List[str], t: int, p: int, n: int,
-                     model: VGGT, device: str, dtype: torch.dtype, args,
-                     Q_frame: List[float], seq_rel: Path, geom_rejects_path: Path):
-    """评估 (p,t,n) 并返回用于写入 triplets.jsonl 的记录字典。"""
-    # [center, prev, next]
-    paths = [image_paths[t], image_paths[p], image_paths[n]]
-    E, K, D_t, conf_t, H, W = vggt_forward_triplet(model, device, dtype, paths)
-
-    # 自适应位移上限（像素）
-    delta_eff = max(args.delta_px, args.delta_px_frac * float(min(H, W)))
-    eps_eff   = float(args.eps_px)
-
-    # 加权几何（稀疏，含 O/U/f/r）
-    m_prev = compute_geom_metrics(D_t, E[0], K[0], E[1], K[1], conf_t,
-                                  eps_px=eps_eff, delta_px=delta_eff, sample_stride=args.sample_stride)
-    m_next = compute_geom_metrics(D_t, E[0], K[0], E[2], K[2], conf_t,
-                                  eps_px=eps_eff, delta_px=delta_eff, sample_stride=args.sample_stride)
-    if (m_prev is None) or (m_next is None):
-        _append_jsonl(geom_rejects_path, {
-            "seq": str(seq_rel),
-            "center": frame_ref(frames, t),
-            "prev":   frame_ref(frames, p),
-            "next":   frame_ref(frames, n),
-            "reason": "metrics_none",
-            "which":  "prev_none" if (m_prev is None) else "next_none"
-        })
-        return None
-
-    def basic(md: dict):
-        return {"O": float(md["O"]), "U": float(md["U"]), "f": float(md["f"]), "r": float(md["r"])}
-    m_prev_basic, m_next_basic = basic(m_prev), basic(m_next)
-
-    # 几何硬阈
-    fail_flags = []
-    if m_prev_basic["r"] > math.radians(args.rmax_deg): fail_flags.append("prev_r")
-    if m_prev_basic["f"] > args.fmax:                   fail_flags.append("prev_f")
-    if m_prev_basic["O"] < args.Omin:                   fail_flags.append("prev_O")
-    if m_prev_basic["U"] < args.Umin:                   fail_flags.append("prev_U")
-    if m_next_basic["r"] > math.radians(args.rmax_deg): fail_flags.append("next_r")
-    if m_next_basic["f"] > args.fmax:                   fail_flags.append("next_f")
-    if m_next_basic["O"] < args.Omin:                   fail_flags.append("next_O")
-    if m_next_basic["U"] < args.Umin:                   fail_flags.append("next_U")
-    if fail_flags:
-        _append_jsonl(geom_rejects_path, {
-            "seq": str(seq_rel),
-            "center": frame_ref(frames, t),
-            "prev":   {**frame_ref(frames, p), "metrics": m_prev_basic},
-            "next":   {**frame_ref(frames, n), "metrics": m_next_basic},
-            "reason": "hard_threshold",
-            "fail_flags": fail_flags,
-            "thresholds": {
-                "rmax_deg": args.rmax_deg, "fmax": args.fmax,
-                "Omin": args.Omin, "Umin": args.Umin
-            }
-        })
-        return None
-
-    # 读取原图
-    img_t = cv2.imread(paths[0], cv2.IMREAD_COLOR)
-    img_p = cv2.imread(paths[1], cv2.IMREAD_COLOR)
-    img_n = cv2.imread(paths[2], cv2.IMREAD_COLOR)
-    if (img_t is None) or (img_p is None) or (img_n is None):
-        _append_jsonl(geom_rejects_path, {
-            "seq": str(seq_rel),
-            "center": frame_ref(frames, t),
-            "reason": "image_read_fail"
-        })
-        return None
-
-    # 光度项
-    Lp, disp_med_p = photometric_loss_dense(
-        img_t, img_p, D_t, K[0], E[0], K[1], E[1], conf_t,
-        eps_px=eps_eff, delta_px=delta_eff, alpha_ssim=args.photo_alpha_ssIM
-    )
-    Ln, disp_med_n = photometric_loss_dense(
-        img_t, img_n, D_t, K[0], E[0], K[2], E[2], conf_t,
-        eps_px=eps_eff, delta_px=delta_eff, alpha_ssim=args.photo_alpha_ssIM
-    )
-    if (Lp is None) or (Ln is None):
-        _append_jsonl(geom_rejects_path, {
-            "seq": str(seq_rel),
-            "center": frame_ref(frames, t),
-            "prev":   frame_ref(frames, p),
-            "next":   frame_ref(frames, n),
-            "reason": "photo_none"
-        })
-        return None
-
-    # 单侧打分（含光度惩罚）
-    Qp = min(Q_frame[t], Q_frame[p])
-    Qn = min(Q_frame[t], Q_frame[n])
-
-    target_disp_px = (args.target_disp_px
-                      if args.target_disp_px > 0
-                      else args.target_disp_factor * float(min(H, W)))
-
-    sp = pair_score(m_prev_basic, Qp,
-                    gamma_O=args.gamma_O, gamma_U=args.gamma_U, w_Q=args.w_Q,
-                    lam_f=args.lam_f, lam_r=args.lam_r,
-                    beta_disp=args.beta_disp_reward, target_disp_px=target_disp_px,
-                    lambda_photo=args.lambda_photo, L_photo=Lp)
-    sn = pair_score(m_next_basic, Qn,
-                    gamma_O=args.gamma_O, gamma_U=args.gamma_U, w_Q=args.w_Q,
-                    lam_f=args.lam_f, lam_r=args.lam_r,
-                    beta_disp=args.beta_disp_reward, target_disp_px=target_disp_px,
-                    lambda_photo=args.lambda_photo, L_photo=Ln)
-
-    # 目标视差奖励（乘到单侧分）
-    if target_disp_px > 0:
-        sigma = 0.35 * target_disp_px
-        if disp_med_p is not None:
-            sp *= (1.0 + args.beta_disp_reward *
-                   float(np.exp(-0.5 * ((disp_med_p - target_disp_px) / max(sigma, 1e-6)) ** 2)))
-        if disp_med_n is not None:
-            sn *= (1.0 + args.beta_disp_reward *
-                   float(np.exp(-0.5 * ((disp_med_n - target_disp_px) / max(sigma, 1e-6)) ** 2)))
-
-    s_trip = float(np.sqrt(max(sp, 1e-12) * max(sn, 1e-12)))
-
-    # 4×4 齐次变换
-    Gt, Gprev, Gnext = to44(E[0]), to44(E[1]), to44(E[2])
-    T_prev_to_t = (Gt @ np.linalg.inv(Gprev)).astype(np.float32)
-    T_next_to_t = (Gt @ np.linalg.inv(Gnext)).astype(np.float32)
-
-    # —— 关键修改：idx 与 dt 以“文件名数字”为准（无法解析时退回列表下标） ——
-    center_idx_num = idx_for_log(frames, t)
-    prev_idx_num   = idx_for_log(frames, p)
-    next_idx_num   = idx_for_log(frames, n)
-    dt_prev_num = int(prev_idx_num - center_idx_num)
-    dt_next_num = int(next_idx_num - center_idx_num)
-
-    prev_diag = {
-        "idx": prev_idx_num, "file": frames[p]["file"], "dt": dt_prev_num,
-        "metrics": m_prev_basic, "Q_pair": float(Qp), "score_side": float(sp),
-        "disp_med": (float(disp_med_p) if disp_med_p is not None else None),
-        "L_photo": float(Lp)
-    }
-    next_diag = {
-        "idx": next_idx_num, "file": frames[n]["file"], "dt": dt_next_num,
-        "metrics": m_next_basic, "Q_pair": float(Qn), "score_side": float(sn),
-        "disp_med": (float(disp_med_n) if disp_med_n is not None else None),
-        "L_photo": float(Ln)
-    }
-
-    return {
-        "center": {"idx": center_idx_num, "file": frames[t]["file"]},
-        "prev": prev_diag,
-        "next": next_diag,
-        "score_triplet": float(s_trip),
-        "K_t":   K[0].astype(np.float32),
-        "K_prev":K[1].astype(np.float32),
-        "K_next":K[2].astype(np.float32),
-        "T_prev_to_t": T_prev_to_t,
-        "T_next_to_t": T_next_to_t,
-        "H": int(H), "W": int(W),
-        "depth_t": D_t.astype(np.float32),
-        "depth_conf_t": (conf_t.astype(np.float32) if conf_t is not None else None)
-    }
 
 
 # ---------------- 保存最佳三元组 ----------------
@@ -791,7 +595,6 @@ def clear_sequence_outputs(out_dir: Path):
 def process_sequence(seq_rel: Path, jpath: Path, image_root: Path, metrics_root: Path,
                      out_root: Path, model: VGGT, device: str, dtype: torch.dtype,
                      args, lap_p50: float):
-    """处理单个序列：收集候选、评估全部 (p,n)、保存最佳、记录拒绝原因。"""
     img_dir = image_root / seq_rel
     if not img_dir.exists():
         print(f"[跳过] 找不到图像目录：{img_dir}")
@@ -809,14 +612,14 @@ def process_sequence(seq_rel: Path, jpath: Path, image_root: Path, metrics_root:
     frame_rejects_path = out_dir / "frame_rejects.jsonl"
     geom_rejects_path  = out_dir / "geom_rejects.jsonl"
 
-    # 硬阈（序列内）与软权（跨序列对齐）
+    # 硬阈与软权
     lap_thresh = compute_seq_lap_thresh(frames, args.min_lap_p)
     Q_frame    = compute_Q_frame(frames, lap_p50)
 
     any_valid = False
     for t in tqdm(range(N), desc=str(seq_rel), leave=False):
         rt = frames[t]
-        # 中心帧质量不过线：记录并跳过
+        # 中心帧质量硬拒
         if frame_bad(rt, lap_thresh, args.max_clip, args.min_val):
             _append_jsonl(frame_rejects_path, {
                 "seq": str(seq_rel),
@@ -826,14 +629,14 @@ def process_sequence(seq_rel: Path, jpath: Path, image_root: Path, metrics_root:
                 "reasons": {
                     "lap_below_quantile": bool(rt["lap_var"] < lap_thresh),
                     "clip_dark_gt_max":    bool(rt["clip_dark"] > args.max_clip),
-                    "clip_bright_gt_max":  bool(rt["clip_bright"] > args.max_clip),
+                    "clip_bright_gt_max":  bool(rt["clip_bright"] > args.min_val),
                     "val_mean_lt_min":     bool(rt["val_mean"] < args.min_val)
                 },
                 "metrics": {k: rt[k] for k in ["lap_var","entropy","edge_density","val_mean","val_std","clip_dark","clip_bright"]}
             })
             continue
 
-        # 收集两侧候选；若某侧为空，记录后跳过
+        # 先收集候选（用于穷举与拒绝日志）
         prev_cands, next_cands = collect_candidates(frames, t, args.window, lap_thresh, args,
                                                     frame_rejects_path, seq_rel)
         if (not prev_cands) or (not next_cands):
@@ -844,12 +647,31 @@ def process_sequence(seq_rel: Path, jpath: Path, image_root: Path, metrics_root:
             })
             continue
 
-        # 穷举 (p,n)，保留分数最高者
+        # —— 关键：整窗一次性前向 —— #
+        order = build_window_order(t, N, args.window)     # [t, t-1, ..., t-window, t+1, ..., t+window]
+        paths = [image_paths[i] for i in order]
+        pos_of = {idx: k for k, idx in enumerate(order)}  # 绝对索引 -> 窗口内位置
+        E_all, K_all, D_t, conf_t, H, W = vggt_forward_window(model, device, dtype, paths, center_pos=0)
+
+        # 提前把窗口内图像读入缓存，避免重复 IO
+        image_cache = {}
+        for idx in order:
+            img = cv2.imread(image_paths[idx], cv2.IMREAD_COLOR)
+            image_cache[idx] = img
+
+        # 穷举 (p,n)，取分数最高
         best = None
         for p in prev_cands:
+            if p not in pos_of:   # 边界/窗口裁剪防御
+                continue
             for n in next_cands:
-                cand = evaluate_triplet(frames, image_paths, t, p, n, model, device, dtype,
-                                        args, Q_frame, seq_rel, geom_rejects_path)
+                if n not in pos_of:
+                    continue
+                cand = evaluate_triplet_from_pack(
+                    frames, t, p, n, order, pos_of,
+                    E_all, K_all, D_t, conf_t, H, W,
+                    image_cache, Q_frame, args, seq_rel, geom_rejects_path
+                )
                 if cand is None:
                     continue
                 if (best is None) or (cand["score_triplet"] > best["score_triplet"]):
@@ -870,6 +692,7 @@ def process_sequence(seq_rel: Path, jpath: Path, image_root: Path, metrics_root:
         _append_jsonl(geom_rejects_path, {"seq": str(seq_rel), "summary": "no_valid_triplet_in_sequence"})
 
 
+
 def run_all_sequences(args):
     """遍历 metrics_root 下的所有序列（以 frames.jsonl 为存在标识），逐一构建三元组。"""
     image_root   = Path(args.image_root)
@@ -886,6 +709,233 @@ def run_all_sequences(args):
         process_sequence(seq_rel, jpath, image_root, metrics_root, out_root,
                          model, device, dtype, args, lap_p50)
 
+def build_window_order(t: int, N: int, window: int) -> List[int]:
+    """
+    生成以 t 为中心的窗口顺序：
+      [t, t-1, t-2, ..., t-window, t+1, t+2, ..., t+window]，越近越靠前。
+    会自动裁剪到 [0, N-1] 边界，不去重（本序列不会重复）。
+    """
+    prevs = [i for i in range(t - 1, max(-1, t - window - 1), -1) if 0 <= i < N]
+    nexts = [i for i in range(t + 1, min(N, t + window + 1)) if 0 <= i < N]
+    order = [t] + prevs + nexts
+    return order
+
+def vggt_forward_window(model: VGGT, device: str, dtype: torch.dtype,
+                        paths: List[str], center_pos: int = 0):
+    """
+    一次性对窗口内所有帧前向：
+      - 返回整窗的 E_all (M,3,4) 与 K_all (M,3,3)
+      - 返回中心帧深度 D_t 与（可选）置信度 conf_t（来自 center_pos）
+      - 返回中心深度分辨率 H,W
+    说明：VGGT 的 batch 维度为 1，时序维度为 M=len(paths)。
+    """
+    images = load_and_preprocess_images(paths).to(device)
+    amp = torch.cuda.amp.autocast(dtype=dtype) if device == "cuda" else nullcontext()
+    with torch.no_grad():
+        with amp:
+            preds = model(images)
+
+    # 解码整窗的外参/内参
+    E_all, K_all = pose_encoding_to_extri_intri(preds["pose_enc"], images.shape[-2:])
+    E_all = E_all[0].detach().cpu().numpy()  # (M,3,4)
+    K_all = K_all[0].detach().cpu().numpy()  # (M,3,3)
+
+    # 深度：取中心位置
+    D = preds["depth"][0].detach().cpu().numpy()  # (M,H,W) 或 (M,1,H,W)
+    if D.ndim == 4 and D.shape[1] == 1:
+        D = D[:, 0]
+    D_t = _as_hw_depth(D[center_pos])
+    H, W = D_t.shape
+
+    # 置信度（可选）
+    conf_t = None
+    if "depth_conf" in preds:
+        C = preds["depth_conf"][0].detach().cpu().numpy()
+        if C.ndim == 4 and C.shape[1] == 1:
+            C = C[:, 0]
+        conf_t = _normalize_conf_map(_as_hw_depth(C[center_pos]).astype(np.float32))
+
+    return E_all, K_all, D_t, conf_t, H, W
+
+
+def evaluate_triplet_from_pack(frames: list,
+                               t: int, p: int, n: int,
+                               order: List[int], pos_of: dict,
+                               E_all: np.ndarray, K_all: np.ndarray,
+                               D_t: np.ndarray, conf_t: Optional[np.ndarray],
+                               H: int, W: int,
+                               image_cache: dict,
+                               Q_frame: List[float],
+                               args, seq_rel: Path,
+                               geom_rejects_path: Path) -> Optional[dict]:
+    """
+    基于单次多帧前向的结果，评估 (p,t,n)。
+    - order: 窗口内绝对帧索引列表（用于定位）
+    - pos_of: 绝对索引 -> 在 E_all/K_all 中的下标
+    - image_cache: 绝对索引 -> 已读入 BGR 图像 (H?,W?,3)
+    返回用于写 triplets.jsonl 的 best 结构（与原 evaluate_triplet 输出兼容）。
+    """
+    # 中心/侧帧在前向结果中的位置
+    ct = pos_of[t]
+    cp = pos_of.get(p, None)
+    cn = pos_of.get(n, None)
+    if (cp is None) or (cn is None):
+        _append_jsonl(geom_rejects_path, {
+            "seq": str(seq_rel),
+            "center": frame_ref(frames, t),
+            "prev": frame_ref(frames, p),
+            "next": frame_ref(frames, n),
+            "reason": "index_not_in_window_pack"
+        })
+        return None
+
+    # 自适应视差带
+    delta_eff = max(args.delta_px, args.delta_px_frac * float(min(H, W)))
+    eps_eff   = float(args.eps_px)
+
+    # 稀疏几何指标
+    m_prev = compute_geom_metrics(D_t, E_all[ct], K_all[ct], E_all[cp], K_all[cp],
+                                  conf_t, eps_px=eps_eff, delta_px=delta_eff,
+                                  sample_stride=args.sample_stride)
+    m_next = compute_geom_metrics(D_t, E_all[ct], K_all[ct], E_all[cn], K_all[cn],
+                                  conf_t, eps_px=eps_eff, delta_px=delta_eff,
+                                  sample_stride=args.sample_stride)
+    if (m_prev is None) or (m_next is None):
+        _append_jsonl(geom_rejects_path, {
+            "seq": str(seq_rel),
+            "center": frame_ref(frames, t),
+            "prev":   frame_ref(frames, p),
+            "next":   frame_ref(frames, n),
+            "reason": "metrics_none",
+            "which":  "prev_none" if (m_prev is None) else "next_none"
+        })
+        return None
+
+    def basic(md: dict):
+        return {"O": float(md["O"]), "U": float(md["U"]), "f": float(md["f"]), "r": float(md["r"])}
+    m_prev_basic, m_next_basic = basic(m_prev), basic(m_next)
+
+    # 硬阈
+    fail_flags = []
+    if m_prev_basic["r"] > math.radians(args.rmax_deg): fail_flags.append("prev_r")
+    if m_prev_basic["f"] > args.fmax:                   fail_flags.append("prev_f")
+    if m_prev_basic["O"] < args.Omin:                   fail_flags.append("prev_O")
+    if m_prev_basic["U"] < args.Umin:                   fail_flags.append("prev_U")
+    if m_next_basic["r"] > math.radians(args.rmax_deg): fail_flags.append("next_r")
+    if m_next_basic["f"] > args.fmax:                   fail_flags.append("next_f")
+    if m_next_basic["O"] < args.Omin:                   fail_flags.append("next_O")
+    if m_next_basic["U"] < args.Umin:                   fail_flags.append("next_U")
+    if fail_flags:
+        _append_jsonl(geom_rejects_path, {
+            "seq": str(seq_rel),
+            "center": frame_ref(frames, t),
+            "prev":   {**frame_ref(frames, p), "metrics": m_prev_basic},
+            "next":   {**frame_ref(frames, n), "metrics": m_next_basic},
+            "reason": "hard_threshold",
+            "fail_flags": fail_flags,
+            "thresholds": {
+                "rmax_deg": args.rmax_deg, "fmax": args.fmax,
+                "Omin": args.Omin, "Umin": args.Umin
+            }
+        })
+        return None
+
+    # 读取图像（从缓存）
+    img_t = image_cache[t]
+    img_p = image_cache[p]
+    img_n = image_cache[n]
+    if (img_t is None) or (img_p is None) or (img_n is None):
+        _append_jsonl(geom_rejects_path, {
+            "seq": str(seq_rel),
+            "center": frame_ref(frames, t),
+            "reason": "image_read_fail"
+        })
+        return None
+
+    # 光度项
+    Lp, disp_med_p = photometric_loss_dense(
+        img_t, img_p, D_t, K_all[ct], E_all[ct], K_all[cp], E_all[cp], conf_t,
+        eps_px=eps_eff, delta_px=delta_eff, alpha_ssim=args.photo_alpha_ssIM)
+    Ln, disp_med_n = photometric_loss_dense(
+        img_t, img_n, D_t, K_all[ct], E_all[ct], K_all[cn], E_all[cn], conf_t,
+        eps_px=eps_eff, delta_px=delta_eff, alpha_ssim=args.photo_alpha_ssIM)
+    if (Lp is None) or (Ln is None):
+        _append_jsonl(geom_rejects_path, {
+            "seq": str(seq_rel),
+            "center": frame_ref(frames, t),
+            "prev":   frame_ref(frames, p),
+            "next":   frame_ref(frames, n),
+            "reason": "photo_none"
+        })
+        return None
+
+    # 单侧打分（含光度）
+    Qp = min(Q_frame[t], Q_frame[p])
+    Qn = min(Q_frame[t], Q_frame[n])
+
+    target_disp_px = (args.target_disp_px
+                      if args.target_disp_px > 0
+                      else args.target_disp_factor * float(min(H, W)))
+
+    sp = pair_score(m_prev_basic, Qp,
+                    gamma_O=args.gamma_O, gamma_U=args.gamma_U, w_Q=args.w_Q,
+                    lam_f=args.lam_f, lam_r=args.lam_r,
+                    lambda_photo=args.lambda_photo, L_photo=Lp)
+    sn = pair_score(m_next_basic, Qn,
+                    gamma_O=args.gamma_O, gamma_U=args.gamma_U, w_Q=args.w_Q,
+                    lam_f=args.lam_f, lam_r=args.lam_r,
+                    lambda_photo=args.lambda_photo, L_photo=Ln)
+
+    # 目标视差奖励
+    if target_disp_px > 0:
+        sigma = 0.35 * target_disp_px
+        if disp_med_p is not None:
+            sp *= (1.0 + args.beta_disp_reward *
+                   float(np.exp(-0.5 * ((disp_med_p - target_disp_px) / max(sigma, 1e-6)) ** 2)))
+        if disp_med_n is not None:
+            sn *= (1.0 + args.beta_disp_reward *
+                   float(np.exp(-0.5 * ((disp_med_n - target_disp_px) / max(sigma, 1e-6)) ** 2)))
+
+    s_trip = float(np.sqrt(max(sp, 1e-12) * max(sn, 1e-12)))
+
+    # 4×4 齐次变换
+    Gt, Gprev, Gnext = to44(E_all[ct]), to44(E_all[cp]), to44(E_all[cn])
+    T_prev_to_t = (Gt @ np.linalg.inv(Gprev)).astype(np.float32)
+    T_next_to_t = (Gt @ np.linalg.inv(Gnext)).astype(np.float32)
+
+    center_idx_num = idx_for_log(frames, t)
+    prev_idx_num   = idx_for_log(frames, p)
+    next_idx_num   = idx_for_log(frames, n)
+    dt_prev_num = int(prev_idx_num - center_idx_num)
+    dt_next_num = int(next_idx_num - center_idx_num)
+
+    prev_diag = {
+        "idx": prev_idx_num, "file": frames[p]["file"], "dt": dt_prev_num,
+        "metrics": m_prev_basic, "Q_pair": float(Qp), "score_side": float(sp),
+        "disp_med": (float(disp_med_p) if disp_med_p is not None else None),
+        "L_photo": float(Lp)
+    }
+    next_diag = {
+        "idx": next_idx_num, "file": frames[n]["file"], "dt": dt_next_num,
+        "metrics": m_next_basic, "Q_pair": float(Qn), "score_side": float(sn),
+        "disp_med": (float(disp_med_n) if disp_med_n is not None else None),
+        "L_photo": float(Ln)
+    }
+
+    return {
+        "center": {"idx": center_idx_num, "file": frames[t]["file"]},
+        "prev": prev_diag,
+        "next": next_diag,
+        "score_triplet": float(s_trip),
+        "K_t":   K_all[ct].astype(np.float32),
+        "K_prev":K_all[cp].astype(np.float32),
+        "K_next":K_all[cn].astype(np.float32),
+        "T_prev_to_t": T_prev_to_t,
+        "T_next_to_t": T_next_to_t,
+        "H": int(H), "W": int(W),
+        "depth_t": D_t.astype(np.float32),
+        "depth_conf_t": (conf_t.astype(np.float32) if conf_t is not None else None)
+    }
 
 # ---------------- 入口 ----------------
 def build_argparser():
@@ -893,17 +943,17 @@ def build_argparser():
     ap = argparse.ArgumentParser()
     # 输入与输出
     ap.add_argument("--image_root",   type=str, required=False,
-                    default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_images",
+                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/All",
                     help="原始图像根目录（与阶段一一致）")
     ap.add_argument("--metrics_root", type=str, required=False,
-                    default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_win5",
+                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10",
                     help="阶段一输出根目录（包含 <seq>/frames.jsonl 与 global_stats.json）")
     ap.add_argument("--out_root",     type=str, required=False,
-                    default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_win5",
+                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10",
                     help="输出根目录（每序列一个 triplets.jsonl；另含 frame/geom 拒绝记录）")
 
     # 滑窗（组合复杂度 ~ k^2）
-    ap.add_argument("--window",       type=int, default=5,
+    ap.add_argument("--window",       type=int, default=10,
                     help="候选前后帧窗口半径 k（全程三帧将做 k×k 笛卡尔积）")
 
     # 稀疏采样（几何指标）
