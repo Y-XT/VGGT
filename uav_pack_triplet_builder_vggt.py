@@ -946,10 +946,10 @@ def build_argparser():
                     default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/All",
                     help="原始图像根目录（与阶段一一致）")
     ap.add_argument("--metrics_root", type=str, required=False,
-                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10",
+                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10_np",
                     help="阶段一输出根目录（包含 <seq>/frames.jsonl 与 global_stats.json）")
     ap.add_argument("--out_root",     type=str, required=False,
-                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10",
+                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10_np",
                     help="输出根目录（每序列一个 triplets.jsonl；另含 frame/geom 拒绝记录）")
 
     # 滑窗（组合复杂度 ~ k^2）

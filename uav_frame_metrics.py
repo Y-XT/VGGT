@@ -103,9 +103,13 @@ def resize_short_side(img: np.ndarray, short_side: int) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root_dir", type=str, default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/All",
+    ap.add_argument("--root_dir", type=str,
+                    #default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/All",
+                    default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_images",
                     help="根目录（包含多个子目录/序列）")
-    ap.add_argument("--out_dir",  type=str, default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10",
+    ap.add_argument("--out_dir",  type=str,
+                    #default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10_new",
+                    default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_metric",
                     help="输出根目录（每序列一个 frames.jsonl + 全局 global_stats.json）")
     ap.add_argument("--min_images", type=int, default=10, help="识别为序列目录的最少图像数")
     ap.add_argument("--short_side", type=int, default=0, help="指标计算时的短边（0 表示不缩放）")
