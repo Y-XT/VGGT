@@ -723,16 +723,16 @@ def build_argparser():
     ap = argparse.ArgumentParser()
     # 输入与输出
     ap.add_argument("--image_root", type=str, required=False,
-                    #default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/All",
-                    default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_images",
+                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/All",
+                    #default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_images",
                     help="原始图像根目录（与阶段一一致）")
     ap.add_argument("--metrics_root", type=str, required=False,
-                    #default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10_new",
-                    default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_metric",
+                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_metrics",
+                    #default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_metric",
                     help="阶段一输出根目录（包含 <seq>/frames.jsonl 与 global_stats.json）")
     ap.add_argument("--out_root", type=str, required=False,
-                    #default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_win10_new",
-                    default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_win10_0.06_lap0.05",
+                    default="/mnt/data_nvme3n1p1/dataset/UAVid2020/uavid_v1.5_official_release/Germany_tri/tri_0.04_lap0.05",
+                    #default="/mnt/data_nvme3n1p1/dataset/UAV_ula/tri_win10_0.04_lap0.05",
                     help="输出根目录（每序列一个 triplets.jsonl；另含 frame/geom 拒绝记录）")
 
     # 滑窗（候选范围）
@@ -762,7 +762,7 @@ def build_argparser():
     # 目标视差（训练有效性）
     ap.add_argument("--target_disp_px", type=float, default=0.0,
                     help="目标视差（像素）；<=0 时按 factor 推断")
-    ap.add_argument("--target_disp_factor", type=float, default=0.06,
+    ap.add_argument("--target_disp_factor", type=float, default=0.04,
                     help="目标视差系数（0.02*min(H,W)）")
 
     # === 新增：邻接偏移（单一整数输入） ===
